@@ -6,6 +6,8 @@ import { Button } from './ui'
 
 type Grid = { cols: number; rows: number }
 export type PaneDisplayTone = 'plain' | 'warn' | 'owned' | 'other'
+/** 远端网格明显偏小的来源：本站其他窗口释放控制后留下，或由其他 Herdr 客户端持续决定。 */
+export type PaneDisplayUndersized = 'site' | 'external'
 
 // Fewer columns than this and agent tables, diffs and status lines wrap.
 export const NARROW_TASK_COLUMNS = 50
@@ -30,7 +32,7 @@ export type PaneDisplaySizing = {
   capacity: Grid | null
   /** The remote grid before this window took control. */
   previous: Grid | null
-  undersized: boolean
+  undersized: PaneDisplayUndersized | null
   disabled: boolean
   onResizeOnce: () => void
   onTakeControl: () => void
@@ -108,9 +110,12 @@ export function PaneDisplayMenu({ compact, label, tone, open, onOpenChange, disp
         </> : sizing.state === 'pending' ? <small className="field-hint" role="status">正在申请尺寸控制…</small>
           : sizing.state === 'blocked' ? <small className="field-error" role="alert">{sizing.reason || '尺寸控制暂不可用'}</small>
             : <>
-              {sizing.undersized && <Button className="button-primary" disabled={sizing.disabled} onClick={act(sizing.onResizeOnce)}>按此窗口尺寸恢复{sizing.capacity ? `（${gridText(sizing.capacity)}）` : ''}</Button>}
-              <Button className={sizing.undersized ? 'button-secondary' : 'button-primary'} disabled={sizing.disabled} onClick={act(sizing.onTakeControl)}>使用此窗口尺寸{sizing.capacity ? `（${gridText(sizing.capacity)}）` : ''}</Button>
-              <small className="field-hint">{sizing.undersized ? '远端比此窗口小，可能是其他设备释放控制后留下的尺寸。恢复只调整一次，随后继续观察。' : `远端会从 ${gridText(sizing.grid)} 改为 ${gridText(sizing.capacity)} 并重新排版，同一终端的其他窗口也会看到变化。`}</small>
+              {/* 其他 Herdr 客户端会收回释放后的尺寸，只有本站留下的网格才提供一次性恢复。 */}
+              {sizing.undersized === 'site' && <Button className="button-primary" disabled={sizing.disabled} onClick={act(sizing.onResizeOnce)}>按此窗口尺寸恢复{sizing.capacity ? `（${gridText(sizing.capacity)}）` : ''}</Button>}
+              <Button className={sizing.undersized === 'site' ? 'button-secondary' : 'button-primary'} disabled={sizing.disabled} onClick={act(sizing.onTakeControl)}>使用此窗口尺寸{sizing.capacity ? `（${gridText(sizing.capacity)}）` : ''}</Button>
+              <small className="field-hint">{sizing.undersized === 'site' ? '远端比此窗口小，可能是其他设备释放控制后留下的尺寸。恢复只调整一次，随后继续观察。'
+                : sizing.undersized === 'external' ? '远端尺寸由其他 Herdr 客户端决定，例如手机上的原生 Herdr；一次性调整会在释放后被收回。使用此窗口尺寸会保持控制，期间按此窗口排版，页面进入后台时会自动释放。'
+                  : `远端会从 ${gridText(sizing.grid)} 改为 ${gridText(sizing.capacity)} 并重新排版，同一终端的其他窗口也会看到变化。`}</small>
               {narrow && !sizing.undersized && <small className="field-error">只有 {sizing.capacity!.cols} 列，Claude Code、Codex 的表格和 diff 可能折行；可以横屏或减小字号后再使用。</small>}
             </>}
         {sizing.reason && sizing.state !== 'blocked' && <small className="field-hint">{sizing.reason}</small>}

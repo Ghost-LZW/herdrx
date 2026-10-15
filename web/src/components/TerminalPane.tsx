@@ -13,7 +13,7 @@ import { api } from '../lib/api'
 import { clipboardImages, MAX_IMAGE_SIZE, ownsImagePaste } from '../lib/imagePaste'
 import { AUTO_FIT_MIN_FONT_SIZE, autoFitLayout, COMPACT_AUTO_FIT_MIN_FONT_SIZE, createFontMeasure, fittedTerminalFont, responsiveTerminalSize, resolvedTerminalFontFamily, whenFontsReady } from '../lib/terminalFit'
 import { Modal } from './Modal'
-import { PaneDisplayMenu, type PaneDisplayTone } from './PaneDisplayMenu'
+import { PaneDisplayMenu, type PaneDisplayTone, type PaneDisplayUndersized } from './PaneDisplayMenu'
 import { attachTerminalTouch } from '../lib/terminalTouch'
 import { DEFAULT_DISPLAY, type TerminalDisplay } from '../lib/displayPreferences'
 import { isLocalInputTarget } from '../lib/keymap'
@@ -35,6 +35,11 @@ const RESIZE_SETTLE_MS = 250
 // pinch well below it asks for the complete grid instead.
 const PINCH_MIN_FONT = 10
 const PINCH_MAX_FONT = 28
+// 远端行或列不超过本窗口容量的这个比例时，角标提示“较小”。
+const UNDERSIZED_RATIO = 0.6
+// 仍挂着的原生 Herdr 客户端会在释放后 0.5 秒内收回尺寸，但观察画布要等快照轮询
+// （每 2 秒）触发的几何探测才更新，第一次探测还可能早于收回，所以观察两轮。
+const RECLAIM_WATCH_MS = 4000
 type Grid = { cols: number; rows: number }
 type GridView = Grid & { fontSize: number; fit: number | null; cropX: boolean; cropY: boolean; capacity: Grid | null }
 
@@ -100,6 +105,7 @@ export function TerminalPane({ compact = false, controlsOpen, onControlsOpenChan
   const [controlState, setControlState] = useState<TerminalControlState>({ pane_id: pane.pane_id, state: 'available' })
   const controlStateRef = useRef(controlState)
   const [controlError, setControlError] = useState('')
+  const [sizingNotice, setSizingNotice] = useState('')
   const [resizeStatus, setResizeStatus] = useState<TerminalResizeStatus | null>(null)
   const [observedGrid, setObservedGrid] = useState<{ cols: number; rows: number } | null>(null)
   const controlling = controlState.state === 'owned'
@@ -127,6 +133,26 @@ export function TerminalPane({ compact = false, controlsOpen, onControlsOpenChan
   // A later release or acquisition ends this attempt: its delayed release must
   // never let go of control the user took again in the meantime.
   const stillSizing = (epoch: number, streamID: number) => sizingEpochRef.current === epoch && streamRef.current === streamID && controlStateRef.current.state === 'owned'
+  // 释放刚由此窗口设定的网格，并观察一段时间：仍挂着的其他 Herdr 客户端（例如手机上的
+  // 原生 Herdr）会收回尺寸，这时要明确提示而不是静默弹回。之后任何尺寸操作、本站其他
+  // 窗口取得控制或终端流重开都会结束观察；观察本身从不释放控制。
+  const releaseAndWatch = (streamID: number, advice = '') => {
+    const kept = observedGridRef.current, asked = sentSizeRef.current
+    releaseSizing()
+    // 只有 Herdr 已经显示过的目标网格才谈得上被收回。
+    if (!kept || kept.cols !== asked.cols || kept.rows !== asked.rows) return
+    const epoch = sizingEpochRef.current, started = performance.now()
+    const poll = () => {
+      if (!mountedRef.current || sizingEpochRef.current !== epoch || streamRef.current !== streamID || controlStateRef.current.state !== 'available') return
+      const grid = observedGridRef.current
+      if (grid && (grid.cols !== kept.cols || grid.rows !== kept.rows)) {
+        setSizingNotice(`释放后，远端尺寸被其他 Herdr 客户端改为 ${grid.cols}×${grid.rows}（例如手机上的原生 Herdr），刚才的调整没有保留。${advice}`)
+        return
+      }
+      if (performance.now() - started < RECLAIM_WATCH_MS) window.setTimeout(poll, 50)
+    }
+    poll()
+  }
   const restoreAndRelease = async () => {
     const target = preControlGridRef.current, streamID = streamRef.current
     if (!target || streamID === null || controlStateRef.current.state !== 'owned') { releaseSizing(); return }
@@ -137,7 +163,7 @@ export function TerminalPane({ compact = false, controlsOpen, onControlsOpenChan
     client.resize(streamID, target.cols, target.rows)
     sentSizeRef.current = target
     await waitForGrid(target)
-    if (stillSizing(epoch, streamID)) releaseSizing()
+    if (stillSizing(epoch, streamID)) releaseAndWatch(streamID)
   }
   // Reflow the remote to this window once and return to observing.
   const resizeOnce = async () => {
@@ -146,7 +172,7 @@ export function TerminalPane({ compact = false, controlsOpen, onControlsOpenChan
     if (streamID === null || streamRef.current !== streamID || controlStateRef.current.state !== 'owned') return
     const epoch = sizingEpochRef.current
     await waitForGrid(sentSizeRef.current)
-    if (stillSizing(epoch, streamID)) releaseSizing()
+    if (stillSizing(epoch, streamID)) releaseAndWatch(streamID, '如需按此窗口排版，请选择“使用此窗口尺寸”并保持控制。')
   }
   const acquireSizing = async () => {
     if (controlStateRef.current.state === 'pending') return
@@ -159,6 +185,7 @@ export function TerminalPane({ compact = false, controlsOpen, onControlsOpenChan
     const size = desiredSizeRef.current
     if (!size) { setControlError('窗口尺寸尚未就绪，请展开终端后重试。'); return }
     setControlError('')
+    setSizingNotice('')
     setResizeStatus(null)
     sizingEpochRef.current++
     preControlGridRef.current = observedGridRef.current ? { ...observedGridRef.current } : null
@@ -1095,11 +1122,15 @@ export function TerminalPane({ compact = false, controlsOpen, onControlsOpenChan
   const sizingDisabled = streamFailed || status !== '可输入' || overlayMode || !connected || (compact && !active)
   const preControlGrid = preControlGridRef.current
   const canRestoreSize = Boolean(preControlGrid && observedGrid && (preControlGrid.cols !== observedGrid.cols || preControlGrid.rows !== observedGrid.rows))
-  // A remote grid well inside this window is usually left behind by a smaller
-  // device that released control; offer to put it back in one step.
-  // Only after another window of this site let go: a native Herdr client that
-  // is simply smaller than this browser is normal and not worth a warning.
-  const undersized = Boolean(strandedByOther && controlSupported && controlState.state === 'available' && gridView?.capacity && gridView.cols <= gridView.capacity.cols * 0.6)
+  // 远端网格明显小于本窗口时提示。本站其他窗口释放后留下的尺寸可以一次性恢复；
+  // 电脑上其他让窗口大片空白的小网格也提示：它通常由其他 Herdr 客户端（例如手机上的
+  // 原生 Herdr）决定，释放后会被收回，只有保持控制才有效。
+  const capacity = gridView?.capacity
+  const fewerCols = Boolean(gridView && capacity && gridView.cols <= capacity.cols * UNDERSIZED_RATIO)
+  const fewerRows = Boolean(gridView && capacity && gridView.rows <= capacity.rows * UNDERSIZED_RATIO)
+  const undersized: PaneDisplayUndersized | null = !controlSupported || controlState.state !== 'available' ? null
+    : strandedByOther && (fewerCols || (!compact && fewerRows)) ? 'site'
+      : !compact && (fewerCols || fewerRows) ? 'external' : null
   const grid = gridView ? `${gridView.cols}×${gridView.rows}` : ''
   const chip: { label: string; tone: PaneDisplayTone } | null = !gridView || overlayMode || searchOpen ? null
     : controlling ? { label: `此窗口控制 ${grid}`, tone: 'owned' }
@@ -1170,6 +1201,8 @@ export function TerminalPane({ compact = false, controlsOpen, onControlsOpenChan
           <Button className="tool-button" aria-label="收起终端工具" onClick={closeToolbar}><X size={14}/></Button>
         </div>
       </header>
+      {/* 放在角标菜单之前：菜单打开时盖住提示，而不是被提示遮住。 */}
+      {sizingNotice && <div className="image-paste-feedback" role="status" aria-label="尺寸提示"><span>{sizingNotice}</span><button aria-label="关闭尺寸提示" onClick={() => setSizingNotice('')}><X size={14}/></button></div>}
       {displayMenu}
       {!streamFailed && status !== '可输入' && <div className="terminal-pending" role="status">{status}</div>}
       {streamFailed && <div className="terminal-connection-feedback" role="alert" aria-label="终端连接错误"><span>{status}</span><Button className="button-primary" onClick={() => setStreamGeneration((value) => value + 1)}>重连终端</Button></div>}
