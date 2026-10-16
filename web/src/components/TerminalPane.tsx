@@ -106,6 +106,7 @@ export function TerminalPane({ compact = false, controlsOpen, onControlsOpenChan
   const controlStateRef = useRef(controlState)
   const [controlError, setControlError] = useState('')
   const [sizingNotice, setSizingNotice] = useState('')
+  const [reclaimedGrid, setReclaimedGrid] = useState<Grid | null>(null)
   const [resizeStatus, setResizeStatus] = useState<TerminalResizeStatus | null>(null)
   const [observedGrid, setObservedGrid] = useState<{ cols: number; rows: number } | null>(null)
   const controlling = controlState.state === 'owned'
@@ -146,7 +147,8 @@ export function TerminalPane({ compact = false, controlsOpen, onControlsOpenChan
       if (!mountedRef.current || sizingEpochRef.current !== epoch || streamRef.current !== streamID || controlStateRef.current.state !== 'available') return
       const grid = observedGridRef.current
       if (grid && (grid.cols !== kept.cols || grid.rows !== kept.rows)) {
-        setSizingNotice(`释放后，远端尺寸被其他 Herdr 客户端改为 ${grid.cols}×${grid.rows}（例如手机上的原生 Herdr），刚才的调整没有保留。${advice}`)
+        setReclaimedGrid(grid)
+        setSizingNotice(`释放后，远端尺寸变为 ${grid.cols}×${grid.rows}，刚才的调整没有保留；可能受其他 Herdr 客户端（例如手机上的原生 Herdr）影响。${advice}`)
         return
       }
       if (performance.now() - started < RECLAIM_WATCH_MS) window.setTimeout(poll, 50)
@@ -766,6 +768,10 @@ export function TerminalPane({ compact = false, controlsOpen, onControlsOpenChan
   useEffect(() => {
     const unsubscribe = client.onTerminalControl(pane.pane_id, (state) => {
       const previous = controlStateRef.current.state
+      // 收到事件即让旧观察失效，即使其他窗口在下次轮询前已经释放。
+      // 本窗口的 pending → owned 流程仍沿用原来的操作代次。
+      if (state.state === 'other' || state.state === 'blocked') sizingEpochRef.current++
+      if (state.state !== 'available') setReclaimedGrid(null)
       controlStateRef.current = state
       setControlState(state)
       if (previous === 'other' && state.state === 'available') setStrandedByOther(true)
@@ -806,6 +812,7 @@ export function TerminalPane({ compact = false, controlsOpen, onControlsOpenChan
     let resetStream = true
     let unsubscribe = () => {}
     const open = async () => {
+      sizingEpochRef.current++
       if (streamRef.current != null) client.closeTerminal(streamRef.current)
       streamRef.current = null
       inputBlockedRef.current = false
@@ -813,6 +820,8 @@ export function TerminalPane({ compact = false, controlsOpen, onControlsOpenChan
       setStatus('正在连接终端…')
       observedGridRef.current = null
       setObservedGrid(null)
+      setReclaimedGrid(null)
+      setSizingNotice('')
       fitRef.current()
       const terminal = termRef.current!
       applyStdin()
@@ -1122,15 +1131,15 @@ export function TerminalPane({ compact = false, controlsOpen, onControlsOpenChan
   const sizingDisabled = streamFailed || status !== '可输入' || overlayMode || !connected || (compact && !active)
   const preControlGrid = preControlGridRef.current
   const canRestoreSize = Boolean(preControlGrid && observedGrid && (preControlGrid.cols !== observedGrid.cols || preControlGrid.rows !== observedGrid.rows))
-  // 远端网格明显小于本窗口时提示。本站其他窗口释放后留下的尺寸可以一次性恢复；
-  // 电脑上其他让窗口大片空白的小网格也提示：它通常由其他 Herdr 客户端（例如手机上的
-  // 原生 Herdr）决定，释放后会被收回，只有保持控制才有效。
+  // 尺寸偏小不能证明当前有其他客户端：刷新也会丢失本站控制历史。
+  // 仅在本窗口确实观察到释放后变化、且网格仍匹配时，引导保持控制。
   const capacity = gridView?.capacity
   const fewerCols = Boolean(gridView && capacity && gridView.cols <= capacity.cols * UNDERSIZED_RATIO)
   const fewerRows = Boolean(gridView && capacity && gridView.rows <= capacity.rows * UNDERSIZED_RATIO)
+  const stillReclaimed = reclaimedGrid && gridView?.cols === reclaimedGrid.cols && gridView.rows === reclaimedGrid.rows
   const undersized: PaneDisplayUndersized | null = !controlSupported || controlState.state !== 'available' ? null
     : strandedByOther && (fewerCols || (!compact && fewerRows)) ? 'site'
-      : !compact && (fewerCols || fewerRows) ? 'external' : null
+      : !compact && (fewerCols || fewerRows) ? stillReclaimed ? 'reclaimed' : 'unknown' : null
   const grid = gridView ? `${gridView.cols}×${gridView.rows}` : ''
   const chip: { label: string; tone: PaneDisplayTone } | null = !gridView || overlayMode || searchOpen ? null
     : controlling ? { label: `此窗口控制 ${grid}`, tone: 'owned' }

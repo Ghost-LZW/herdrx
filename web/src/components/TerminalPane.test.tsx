@@ -1396,7 +1396,7 @@ describe('TerminalPane chat view', () => {
 })
 
 describe('TerminalPane mobile display and sizing', () => {
-  afterEach(() => vi.restoreAllMocks())
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks() })
 
   const frameEmitter = (frames: ReturnType<typeof vi.spyOn>) => (seq: bigint, cols: number, rows: number) => act(() => (frames.mock.calls[0] as unknown as [string, (frame: unknown) => void])[1]({ streamID: 7, seq, full: true, cols, rows, ansi: new TextEncoder().encode('frame') }))
 
@@ -1511,7 +1511,93 @@ describe('TerminalPane mobile display and sizing', () => {
     expect(screen.queryByRole('button', { name: /显示与尺寸/ })).not.toBeInTheDocument()
   })
 
-  it('calls out a remote that another Herdr client keeps well inside this window and offers to keep control', async () => {
+  it('keeps one-step reflow available after refreshing a grid left by another site window', async () => {
+    vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(1200)
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(700)
+    const client = new WorkbenchClient('hst_test')
+    vi.spyOn(client, 'openTerminal').mockResolvedValue(7)
+    const frames = vi.spyOn(client, 'onTerminal').mockReturnValue(() => true)
+    vi.spyOn(client, 'acknowledge').mockImplementation(() => {})
+    const sizing = enableSizing(client)
+    const props = { client, pane: mockPane, connectionEpoch: 1, active: true, onFocus: () => {}, theme: {}, enhancedContrast: false, display: { fontSize: 14, zoom: 100, mode: 'auto' as const }, layoutVersion: 0 }
+    const { unmount } = render(<TerminalPane {...props}/>)
+    await waitFor(() => expect(frames).toHaveBeenCalledTimes(1))
+    frameEmitter(frames)(1n, 46, 42)
+    sizing.state({ pane_id: mockPane.pane_id, state: 'other' })
+    sizing.state({ pane_id: mockPane.pane_id, state: 'available' })
+    fireEvent.click(screen.getByRole('button', { name: '显示与尺寸：远端 46×42 · 较小' }))
+    expect(screen.getByRole('button', { name: '按此窗口尺寸恢复（142×49）' })).toBeInTheDocument()
+    unmount()
+    frames.mockClear()
+    render(<TerminalPane {...props}/>)
+    await waitFor(() => expect(frames).toHaveBeenCalledTimes(1))
+    frameEmitter(frames)(2n, 46, 42)
+    fireEvent.click(screen.getByRole('button', { name: '显示与尺寸：远端 46×42 · 较小' }))
+    // 新开的观察页面无法确定是否仍有原生客户端在线。
+    expect(screen.queryByRole('button', { name: '按此窗口尺寸恢复（142×49）' })).toBeInTheDocument()
+    expect(screen.getByRole('dialog', { name: '显示与尺寸' })).not.toHaveTextContent('一次性调整会在释放后被收回')
+  })
+
+  it('warns about narrow columns when a desktop split is only short of rows', async () => {
+    vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(390)
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(700)
+    const client = new WorkbenchClient('hst_test')
+    vi.spyOn(client, 'openTerminal').mockResolvedValue(7)
+    const frames = vi.spyOn(client, 'onTerminal').mockReturnValue(() => true)
+    vi.spyOn(client, 'acknowledge').mockImplementation(() => {})
+    enableSizing(client)
+    render(<TerminalPane client={client} pane={mockPane} connectionEpoch={1} active onFocus={() => {}} theme={{}} enhancedContrast={false} display={{ fontSize: 14, zoom: 100, mode: 'auto' }} layoutVersion={0}/>)
+    await waitFor(() => expect(frames).toHaveBeenCalledTimes(1))
+    frameEmitter(frames)(1n, 100, 20)
+    fireEvent.click(screen.getByRole('button', { name: '显示与尺寸：100×20 · 已裁切' }))
+    expect(screen.getByRole('dialog', { name: '显示与尺寸' })).toHaveTextContent('只有 46 列')
+  })
+
+  it.each(['other', 'reconnect', 'background'] as const)('cancels a reclaim watch when %s interrupts it between polls', async (interruption) => {
+    vi.useFakeTimers()
+    vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(1200)
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(700)
+    const client = new WorkbenchClient('hst_test')
+    vi.spyOn(client, 'openTerminal').mockResolvedValue(7)
+    const frames = vi.spyOn(client, 'onTerminal').mockReturnValue(() => true)
+    vi.spyOn(client, 'acknowledge').mockImplementation(() => {})
+    const sizing = enableSizing(client)
+    const props = { client, pane: mockPane, active: true, onFocus: () => {}, theme: {}, enhancedContrast: false, display: { fontSize: 14, zoom: 100, mode: 'auto' as const }, layoutVersion: 0 }
+    const { rerender } = render(<TerminalPane {...props} connectionEpoch={1}/>)
+    await act(async () => {})
+    const emit = frameEmitter(frames)
+    emit(1n, 46, 42)
+    sizing.state({ pane_id: mockPane.pane_id, state: 'other' })
+    sizing.state({ pane_id: mockPane.pane_id, state: 'available' })
+    fireEvent.click(screen.getByRole('button', { name: '显示与尺寸：远端 46×42 · 较小' }))
+    fireEvent.click(screen.getByRole('button', { name: '按此窗口尺寸恢复（142×49）' }))
+    await act(async () => {})
+    emit(2n, 142, 49)
+    await act(async () => { await vi.advanceTimersByTimeAsync(50) })
+    expect(sizing.release).toHaveBeenCalledTimes(1)
+    if (interruption === 'other') {
+      // 快速的一次性调整或网络集中送达事件，都可能发生在两次轮询之间。
+      sizing.state({ pane_id: mockPane.pane_id, state: 'other' })
+      sizing.state({ pane_id: mockPane.pane_id, state: 'available' })
+    } else if (interruption === 'reconnect') {
+      // 新的工作台连接可能复用旧连接的流 ID。
+      frames.mockClear()
+      rerender(<TerminalPane {...props} connectionEpoch={2}/>)
+      await act(async () => {})
+    } else {
+      const visible = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden')
+      fireEvent(document, new Event('visibilitychange'))
+      visible.mockReturnValue('visible')
+      fireEvent(document, new Event('visibilitychange'))
+    }
+    emit(3n, 90, 30)
+    const releases = sizing.release.mock.calls.length
+    await act(async () => { await vi.advanceTimersByTimeAsync(50) })
+    expect(screen.queryByRole('status', { name: '尺寸提示' })).not.toBeInTheDocument()
+    expect(sizing.release).toHaveBeenCalledTimes(releases)
+  })
+
+  it('offers either one-step reflow or continued control when the smaller grid has an unknown source', async () => {
     vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(1200)
     vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(700)
     const client = new WorkbenchClient('hst_test')
@@ -1522,17 +1608,17 @@ describe('TerminalPane mobile display and sizing', () => {
     render(<TerminalPane client={client} pane={mockPane} connectionEpoch={1} active onFocus={() => {}} theme={{}} enhancedContrast={false} display={{ fontSize: 14, zoom: 100, mode: 'auto' }} layoutVersion={0}/>)
     await waitFor(() => expect(frames).toHaveBeenCalledTimes(1))
     const emit = frameEmitter(frames)
-    // 手机上的原生 Herdr 客户端按自己的尺寸排版任务。
+    // 仅凭画面偏小，无法判断当前有哪些客户端在线。
     emit(1n, 46, 42)
     fireEvent.click(await screen.findByRole('button', { name: '显示与尺寸：远端 46×42 · 较小' }))
     const menu = screen.getByRole('dialog', { name: '显示与尺寸' })
-    // 一次性调整释放后就会被收回，不再提供。
-    expect(within(menu).queryByRole('button', { name: /按此窗口尺寸恢复/ })).not.toBeInTheDocument()
-    expect(menu).toHaveTextContent('远端尺寸由其他 Herdr 客户端决定')
-    expect(menu).toHaveTextContent('一次性调整会在释放后被收回')
+    expect(within(menu).getByRole('button', { name: /按此窗口尺寸恢复/ })).toBeInTheDocument()
+    expect(menu).toHaveTextContent('可能是先前留下的尺寸')
+    expect(menu).toHaveTextContent('也可能受其他 Herdr 客户端')
+    expect(menu).not.toHaveTextContent('一次性调整会在释放后被收回')
     expect(menu).toHaveTextContent('页面进入后台时会自动释放')
     const keep = within(menu).getByRole('button', { name: '使用此窗口尺寸（142×49）' })
-    expect(keep).toHaveClass('button-primary')
+    expect(keep).toHaveClass('button-secondary')
     fireEvent.click(keep)
     await waitFor(() => expect(sizing.acquire).toHaveBeenCalledWith(7, 142, 49, false))
     emit(2n, 142, 49)
@@ -1553,7 +1639,7 @@ describe('TerminalPane mobile display and sizing', () => {
     await waitFor(() => expect(frames).toHaveBeenCalledTimes(1))
     frameEmitter(frames)(1n, 120, 20)
     fireEvent.click(await screen.findByRole('button', { name: '显示与尺寸：远端 120×20 · 较小' }))
-    expect(screen.getByRole('dialog', { name: '显示与尺寸' })).toHaveTextContent('远端尺寸由其他 Herdr 客户端决定')
+    expect(screen.getByRole('dialog', { name: '显示与尺寸' })).toHaveTextContent('也可能受其他 Herdr 客户端')
   })
 
   it('stays quiet while the remote fills most of a desktop window', async () => {
@@ -1613,10 +1699,12 @@ describe('TerminalPane mobile display and sizing', () => {
     expect(screen.queryByRole('status', { name: '尺寸提示' })).not.toBeInTheDocument()
     // 仍挂着的原生 Herdr 客户端收回尺寸。
     emit(3n, 46, 42)
-    expect(await screen.findByRole('status', { name: '尺寸提示' })).toHaveTextContent('远端尺寸被其他 Herdr 客户端改为 46×42')
-    // 角标不再提供会再次被收回的一次性恢复。
+    expect(await screen.findByRole('status', { name: '尺寸提示' })).toHaveTextContent('释放后，远端尺寸变为 46×42')
+    // 关闭提示后，仍保留已观察到的尺寸变化及对应操作建议。
+    fireEvent.click(screen.getByRole('button', { name: '关闭尺寸提示' }))
     fireEvent.click(await screen.findByRole('button', { name: '显示与尺寸：远端 46×42 · 较小' }))
     expect(screen.queryByRole('button', { name: /按此窗口尺寸恢复/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('dialog', { name: '显示与尺寸' })).toHaveTextContent('刚才释放后远端尺寸再次变化')
     expect(sizing.release).toHaveBeenCalledTimes(1)
     // 重新取得控制时清除提示。
     fireEvent.click(screen.getByRole('button', { name: '使用此窗口尺寸（142×49）' }))
@@ -1647,7 +1735,7 @@ describe('TerminalPane mobile display and sizing', () => {
     emit(3n, 173, 54)
     await waitFor(() => expect(sizing.release).toHaveBeenCalledTimes(1))
     emit(4n, 49, 40)
-    expect(await screen.findByRole('status', { name: '尺寸提示' })).toHaveTextContent('远端尺寸被其他 Herdr 客户端改为 49×40')
+    expect(await screen.findByRole('status', { name: '尺寸提示' })).toHaveTextContent('释放后，远端尺寸变为 49×40')
     expect(sizing.release).toHaveBeenCalledTimes(1)
   })
 
