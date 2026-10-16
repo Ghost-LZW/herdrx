@@ -195,7 +195,7 @@ func TestScreenReadIgnoresAnotherWindowsCancellation(t *testing.T) {
 type screenTestEndpoint struct {
 	mu         sync.Mutex
 	screen     string
-	readErr    error
+	readErrors map[string]error
 	reads      []map[string]any
 	inputs     atomic.Int32
 	beforeRead func(context.Context) error
@@ -227,9 +227,10 @@ func (e *screenTestEndpoint) Call(ctx context.Context, method string, params any
 		}
 		e.mu.Lock()
 		defer e.mu.Unlock()
-		e.reads = append(e.reads, params.(map[string]any))
-		if e.readErr != nil {
-			return nil, e.readErr
+		values := params.(map[string]any)
+		e.reads = append(e.reads, values)
+		if err := e.readErrors[values["pane_id"].(string)]; err != nil {
+			return nil, err
 		}
 		return json.Marshal(map[string]any{"type": "pane_read", "read": map[string]any{"text": e.screen, "truncated": false}})
 	case "pane.send_input":
@@ -404,7 +405,8 @@ func TestScreenWatchLimitAndErrors(t *testing.T) {
 	}
 
 	endpoint.mu.Lock()
-	endpoint.readErr = &herdr.APIError{Code: "pane_not_found", Message: "no pane"}
+	// 取消消息可能仍在传输中，只让目标 pane 失败，避免影响尚未结束的其他订阅。
+	endpoint.readErrors = map[string]error{"p_gone": &herdr.APIError{Code: "pane_not_found", Message: "no pane"}}
 	endpoint.mu.Unlock()
 	browser.send(map[string]any{"t": "screen.watch", "id": "gone", "pane_id": "p_gone"})
 	message := browser.next("screen.error")
